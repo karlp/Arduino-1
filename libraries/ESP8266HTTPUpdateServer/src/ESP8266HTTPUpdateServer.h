@@ -64,6 +64,7 @@ protected:
     void handle_end();
     void handle_error(int);
     void handle_progress(unsigned int, unsigned int);
+    void handle_firmware(int mode);
 
 };
 

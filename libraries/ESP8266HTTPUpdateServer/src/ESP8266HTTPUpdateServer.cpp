@@ -22,6 +22,15 @@ void ESP8266HTTPUpdateServer::debug(const char *fmt, Ts... args) {
     }
 }
 
+static const char * mode_to_string(int mode) {
+    switch (mode) {
+    case U_FLASH: return "Flash";
+    case U_SPIFFS: return "SPIFFS";
+    case U_AUTH: return "Auth";
+    default: return "unknown!";
+    }
+}
+
 ESP8266HTTPUpdateServer::ESP8266HTTPUpdateServer(bool serial_debug)
 {
     _serial_output = serial_debug;
@@ -30,6 +39,66 @@ ESP8266HTTPUpdateServer::ESP8266HTTPUpdateServer(bool serial_debug)
     _password = NULL;
     _authenticated = false;
 }
+
+void ESP8266HTTPUpdateServer::handle_firmware(int mode) {
+    // handler for the file upload, get's the sketch bytes, and writes
+    // them through the Update object
+    HTTPUpload& upload = _server->upload();
+    if (upload.status == UPLOAD_FILE_START) {
+        if (_serial_output) {
+            Serial.setDebugOutput(true);
+        }
+        handle_start();
+
+        _authenticated = (_username == NULL || _password == NULL || _server->authenticate(_username, _password));
+        if (!_authenticated) {
+            debug("Unauthenticated Update\n");
+            handle_error(1);
+            return;
+        }
+
+        WiFiUDP::stopAll();
+        debug("Update %s: %s\n", mode_to_string(mode), upload.filename.c_str());
+        // DUMB, checks for space for space?!
+        uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        if (!Update.begin(maxSketchSpace, mode)) {//start with max available size
+            if (_serial_output) {
+                Update.printError(Serial);
+                handle_error(2);
+            }
+        }
+        handle_progress(0, upload.totalSize);
+    } else if (_authenticated && upload.status == UPLOAD_FILE_WRITE) {
+        debug(".");
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            if (_serial_output) {
+                Update.printError(Serial);
+                handle_error(3);
+            }
+        }
+        handle_progress(upload.currentSize, upload.totalSize);
+    } else if (_authenticated && upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) { //true to set the size to the current progress
+            debug("Update Success: %u\nRebooting...\n", upload.totalSize);
+            handle_progress(upload.totalSize, upload.totalSize);
+            handle_end();
+        } else {
+            if (_serial_output) {
+                Update.printError(Serial);
+                handle_error(4);
+            }
+        }
+        if (_serial_output) {
+            Serial.setDebugOutput(false);
+        }
+    } else if (_authenticated && upload.status == UPLOAD_FILE_ABORTED) {
+        Update.end();
+        debug("Update was aborted");
+        handle_error(5);
+    }
+    delay(0);
+}
+
 
 void ESP8266HTTPUpdateServer::setup(ESP8266WebServer *server, const char * path, const char * username, const char * password)
 {
@@ -44,7 +113,6 @@ void ESP8266HTTPUpdateServer::setup(ESP8266WebServer *server, const char * path,
         }
         _server->send(200, "text/html", _serverIndex);
     });
-
     // handler for the /update form POST (once file upload finishes)
     _server->on(path, HTTP_POST, [&]() {
         if (!_authenticated) {
@@ -53,62 +121,28 @@ void ESP8266HTTPUpdateServer::setup(ESP8266WebServer *server, const char * path,
         _server->send(200, "text/html", Update.hasError() ? _failedResponse : _successResponse);
         ESP.restart();
     }, [&]() {
-        // handler for the file upload, get's the sketch bytes, and writes
-        // them through the Update object
-        HTTPUpload& upload = _server->upload();
-        if (upload.status == UPLOAD_FILE_START) {
-            if (_serial_output) {
-                Serial.setDebugOutput(true);
-            }
-            handle_start();
-
-            _authenticated = (_username == NULL || _password == NULL || _server->authenticate(_username, _password));
-            if (!_authenticated) {
-                debug("Unauthenticated Update\n");
-                handle_error(1);
-                return;
-            }
-
-            WiFiUDP::stopAll();
-            debug("Update: %s\n", upload.filename.c_str());
-            uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-            if (!Update.begin(maxSketchSpace)) {//start with max available size
-                if (_serial_output) {
-                    Update.printError(Serial);
-                    handle_error(2);
-                }
-            }
-            handle_progress(0, upload.totalSize);
-        } else if (_authenticated && upload.status == UPLOAD_FILE_WRITE) {
-            debug(".");
-            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-                if (_serial_output) {
-                    Update.printError(Serial);
-                    handle_error(3);
-                }
-            }
-            handle_progress(upload.currentSize, upload.totalSize);
-        } else if (_authenticated && upload.status == UPLOAD_FILE_END) {
-            if (Update.end(true)) { //true to set the size to the current progress
-                debug("Update Success: %u\nRebooting...\n", upload.totalSize);
-                handle_progress(upload.totalSize, upload.totalSize);
-                handle_end();
-            } else {
-                if (_serial_output) {
-                    Update.printError(Serial);
-                    handle_error(4);
-                }
-            }
-            if (_serial_output) {
-                Serial.setDebugOutput(false);
-            }
-        } else if (_authenticated && upload.status == UPLOAD_FILE_ABORTED) {
-            Update.end();
-            debug("Update was aborted");
-            handle_error(5);
-        }
-        delay(0);
+        handle_firmware(U_FLASH);
     });
+
+    /* Also register a handler for %s_fs to update the filesystem*/
+    char rpath[strlen(path) + 4];
+    sprintf(rpath, "%s_fs", path);
+    _server->on(rpath, HTTP_GET, [&]() {
+        if (_username != NULL && _password != NULL && !_server->authenticate(_username, _password)) {
+            return _server->requestAuthentication();
+        }
+        _server->send(200, "text/html", _serverIndex);
+    });
+    _server->on(rpath, HTTP_POST, [&]() {
+        if (!_authenticated) {
+            return _server->requestAuthentication();
+        }
+        _server->send(200, "text/html", Update.hasError() ? _failedResponse : _successResponse);
+        ESP.restart();
+    }, [&]() {
+        handle_firmware(U_SPIFFS);
+    });
+
 }
 
 void ESP8266HTTPUpdateServer::onStart(THandlerFunction fn)
